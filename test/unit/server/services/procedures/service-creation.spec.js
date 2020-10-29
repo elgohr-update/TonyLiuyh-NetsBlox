@@ -1,7 +1,7 @@
 describe('service-creation', function() {
     const utils = require('../../../../assets/utils');
     const ServiceCreation = utils.reqSrc('services/procedures/service-creation/service-creation');
-    const RPCMock = require('../../../../assets/mock-rpc');
+    const RPCMock = require('../../../../assets/mock-service');
     const service = new RPCMock(ServiceCreation);
     const assert = require('assert');
     // All entries from NetsBlox are sent as strings
@@ -12,6 +12,56 @@ describe('service-creation', function() {
         ['createServiceFromTable', ['name', 'data', 'options']],
         ['deleteService', ['name']],
     ]);
+
+    describe('createServiceFromTable', function() {
+        const data = toStringEntries([
+            ['id', 'name', 'value'],
+            [1, 'brian', 1],
+            [2, 'steve', 2],
+        ]);
+
+        it('should require login', async function() {
+            await assert.rejects(
+                () => service.createServiceFromTable('testName', data)
+            );
+        });
+
+        it('should reject if no RPC name', async function() {
+            const options = {RPCs: [[['help', 'serviceName'], []]]};
+            service.setRequester('client_1234', 'brian');
+            await assert.rejects(
+                () => service.createServiceFromTable('testName', data, options),
+                /name/
+            );
+        });
+
+        it('should disallow RPC named "serviceName"', async function() {
+            const options = {RPCs: [[['name', 'serviceName'], []]]};
+            service.setRequester('client_1234', 'brian');
+            await assert.rejects(
+                () => service.createServiceFromTable('testName', data, options),
+                /serviceName/
+            );
+        });
+
+        it('should disallow RPC names starting with _', async function() {
+            const options = {RPCs: [[['name', '_name'], []]]};
+            service.setRequester('client_1234', 'brian');
+            await assert.rejects(
+                () => service.createServiceFromTable('testName', data, options),
+                /_name/
+            );
+        });
+
+        it('should disallow RPC without implementation', async function() {
+            const options = {RPCs: [[['name', 'testRPC']]]};
+            service.setRequester('client_1234', 'brian');
+            await assert.rejects(
+                () => service.createServiceFromTable('testName', data, options),
+                /code.*query/
+            );
+        });
+    });
 
     describe('getConstantFields ', function() {
         it('should detect constant fields', function() {
@@ -67,7 +117,7 @@ describe('service-creation', function() {
             ]);
             const options = service.getCreateFromTableOptions(data);
             const rpcNames = options.RPCs.map(rpc => rpc.name);
-            assert(rpcNames.includes('get#Counted'));
+            assert(rpcNames.includes('get#CountedColumn'));
         });
 
         it('should support $ symbol', function() {
@@ -77,7 +127,7 @@ describe('service-creation', function() {
             ]);
             const options = service.getCreateFromTableOptions(data);
             const rpcNames = options.RPCs.map(rpc => rpc.name);
-            assert(rpcNames.includes('get$Spent'), `Could not find get$Spent: ${rpcNames.join(', ')}`);
+            assert(rpcNames.includes('get$SpentColumn'), `Could not find get$Spent: ${rpcNames.join(', ')}`);
         });
 
         it('should support % symbol', function() {
@@ -87,7 +137,7 @@ describe('service-creation', function() {
             ]);
             const options = service.getCreateFromTableOptions(data);
             const rpcNames = options.RPCs.map(rpc => rpc.name);
-            assert(rpcNames.includes('get%OfTotal'), `Could not find get%OfTotal: ${rpcNames.join(', ')}`);
+            assert(rpcNames.includes('get%OfTotalColumn'), `Could not find get%OfTotal: ${rpcNames.join(', ')}`);
         });
 
         it('should support accented characters', function() {
@@ -97,7 +147,7 @@ describe('service-creation', function() {
             ]);
             const options = service.getCreateFromTableOptions(data);
             const rpcNames = options.RPCs.map(rpc => rpc.name);
-            assert(rpcNames.includes('getÉrdösNumber'), `Could not find getÉrdösNumber: ${rpcNames.join(', ')}`);
+            assert(rpcNames.includes('getÉrdösNumberColumn'), `Could not find getÉrdösNumber: ${rpcNames.join(', ')}`);
         });
     });
 });

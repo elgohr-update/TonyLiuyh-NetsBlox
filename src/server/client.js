@@ -16,6 +16,7 @@ var counter = 0,
 
 let clientCounter = 0;
 
+const _ = require('lodash');
 const assert = require('assert');
 const Messages = require('./storage/messages');
 const ProjectActions = require('./storage/project-actions');
@@ -136,7 +137,7 @@ class Client {
             }
         });
 
-        this._socket.on('close', () => this.close());
+        this._socket.on('close', () => this.close(this.connError));
 
         // change the heartbeat to use ping/pong from the ws spec
         this.keepAlive();
@@ -149,7 +150,7 @@ class Client {
         });
     }
 
-    close () {
+    close (err) {
         this._logger.trace(`closed socket for ${this.uuid} (${this.username})`);
         if (this.nextHeartbeat) {
             clearTimeout(this.nextHeartbeat);
@@ -159,7 +160,7 @@ class Client {
         }
         this.onclose.forEach(fn => fn.call(this));
         this.onclose = [];  // ensure no double-calling of close
-        this.onClose(this);
+        this.onClose(err);
     }
 
     async onMessage (msg) {
@@ -182,9 +183,13 @@ class Client {
 
     checkAlive() {
         const sinceLastMsg = Date.now() - this.lastSocketActivity;
-        if (sinceLastMsg > 2*Client.HEARTBEAT_INTERVAL || this.isSocketDead()) {
+        const hasTimedOut = sinceLastMsg > 2*Client.HEARTBEAT_INTERVAL;
+        if (hasTimedOut) {
+            this.connError = new Error('Websocket is unresponsive (timeout)');
             this._socket.terminate();
-            this.close();
+        } else if (this.isSocketDead()) {
+            this.connError = new Error('Websocket is broken');
+            this._socket.terminate();
         } else {
             if (this.nextHeartbeatCheck) {
                 clearTimeout(this.nextHeartbeatCheck);
@@ -302,7 +307,7 @@ class Client {
 
     getPublicId () {
         // Look up the current project, role names
-        return Projects.getRawProjectById(this.projectId)
+        return Projects.getProjectMetadataById(this.projectId)
             .then(metadata => {
                 if (!metadata.roles[this.roleId]) {
                     throw new Error('Role not found');
@@ -319,11 +324,10 @@ class Client {
         const address = await NetsBloxAddress.new(dstId, this.projectId, this.roleId);
         const states = address.resolve();
         const clients = states
-            .map(state => {
+            .flatMap(state => {
                 const [projectId, roleId] = state;
                 return NetworkTopology.getSocketsAt(projectId, roleId);
-            })
-            .reduce((l1, l2) => l1.concat(l2), []);
+            });
 
         clients.forEach(client => {
             msg.dstId = Constants.EVERYONE;
@@ -342,17 +346,10 @@ class Client {
         }
     }
 
-    async requestActionsAfter (actionId, silent) {
-        if (!this.projectId) {
-            this._logger.error(`User requested actions without project: ${this.username}`);
-            this.send({type: 'request-actions-complete'});
-            return;
-        }
-
+    async requestActionsAfter (projectId, roleId, actionId, silent) {
         try {
-            const actions = await ProjectActions.getActionsAfter(this.projectId, this.roleId, actionId);
+            const actions = await ProjectActions.getActionsAfter(projectId, roleId, actionId);
             actions.forEach(action => this.send(action));
-            this.send({type: 'request-actions-complete'});
         } catch (err) {
             if (!silent) {
                 this.send({
@@ -362,11 +359,12 @@ class Client {
                 });
             }
         }
+        this.send({type: 'request-actions-complete'});
     }
 
     setState(projectId, roleId, username) {
         this.projectId = projectId && projectId.toString();
-        this.roleId = roleId;
+        this.roleId = roleId || this.roleId;
         this.username = username || this.uuid;
         this.loggedIn = Utils.isSocketUuid(this.username);
     }
@@ -408,7 +406,7 @@ Client.MessageHandlers = {
     'message': async function(msg) {
         const dstIds = msg.dstId instanceof Array ? msg.dstId : [msg.dstId];
         const recipients = await Promise.all(dstIds.map(dstId => this.sendMessageTo(msg, dstId)));
-        msg.recipients = recipients.reduce((l1, l2) => l1.concat(l2), []);
+        msg.recipients = recipients.flat();
         msg.dstId = dstIds;
         msg.srcProjectId = this.projectId;
         return this.saveMessage(msg, this.projectId);
@@ -477,7 +475,7 @@ Client.MessageHandlers = {
 
     'permission-elevation-request': function(msg) {
         const {projectId} = msg;
-        return Projects.getRawProjectById(this.projectId)
+        return Projects.getProjectMetadataById(this.projectId)
             .then(metadata => {
                 const {owner} = metadata;
                 const sockets = NetworkTopology.getSocketsAtProject(projectId);
@@ -536,11 +534,8 @@ Client.MessageHandlers = {
             this._logger.trace(`Exporting project for ${projectId}` +
                 ` to ${this.username}`);
 
-            this.send({
-                type: 'export-room',
-                content: xml,
-                action: msg.action
-            });
+            _.extend(msg, {content: xml});
+            this.send(msg);
         }
     },
 
@@ -549,8 +544,8 @@ Client.MessageHandlers = {
     },
 
     'request-actions': function(msg) {
-        const {actionId, silent=true} = msg;
-        return this.requestActionsAfter(actionId, silent);
+        const {projectId, roleId, actionId, silent=true} = msg;
+        return this.requestActionsAfter(projectId, roleId, actionId, silent);
     }
 };
 

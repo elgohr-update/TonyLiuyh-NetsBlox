@@ -3,11 +3,12 @@ describe('publicroles', function() {
     const Projects = utils.reqSrc('storage/projects');
     const assert = require('assert');
     const PublicRoles = utils.reqSrc('services/procedures/public-roles/public-roles');
-    const RPCMock = require('../../../../assets/mock-rpc');
+    const RPCMock = require('../../../../assets/mock-service');
     const publicroles = new RPCMock(PublicRoles);
 
     utils.verifyRPCInterfaces('PublicRoles', [
-        ['requestPublicRoleId']
+        ['getPublicRoleId'],
+        ['requestPublicRoleId'],
     ]);
 
     describe('getPublicRoleId', function() {

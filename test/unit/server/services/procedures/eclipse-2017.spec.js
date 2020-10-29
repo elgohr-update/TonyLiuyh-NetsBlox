@@ -7,6 +7,9 @@ describe('Eclipse 2017', function() {
         eclipsePath = utils.reqSrc('../../utils/rpc/eclipse-2017/eclipsePath');
 
     utils.verifyRPCInterfaces('Eclipse2017', [
+        ['availableStations', ['maxReadingMedian', 'maxDistanceFromCenter', 'latitude', 'longitude', 'maxDistanceFromPoint']],
+        ['selectSectionBased', ['numSections', 'perSection']],
+        ['selectPointBased'],
         ['stations', []],
         ['stationsInfo', []],
         ['eclipsePath', []],
@@ -177,7 +180,7 @@ describe('Eclipse 2017', function() {
     //         assert(stationUtils.selected);
     //     });
 
-    //     it.only('.selected should return station ids as an array', function(done) {
+    //     it('.selected should return station ids as an array', function(done) {
     //         stationUtils.selected().then(stations => {
     //             assert(Array.isArray(stations));
     //             assert(stations.length > 100);

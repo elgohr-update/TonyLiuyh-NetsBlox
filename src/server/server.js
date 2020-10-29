@@ -27,6 +27,7 @@ var express = require('express'),
     // Session and cookie info
     cookieParser = require('cookie-parser');
 
+const {RequestError} = require('./api/core/errors');
 const CLIENT_ROOT = path.join(__dirname, '..', 'browser');
 const indexTpl = dot.template(fs.readFileSync(path.join(CLIENT_ROOT, 'index.dot')));
 const middleware = require('./routes/middleware');
@@ -34,6 +35,8 @@ const Client = require('./client');
 const Messages = require('./services/messages');
 const assert = require('assert');
 const request = require('request');
+const CustomServicesHosts = require('./api/core/services-hosts');
+const RestAPI = require('./api/rest');
 
 var Server = function(opts) {
     this._logger = new Logger('netsblox');
@@ -64,7 +67,6 @@ Server.prototype.configureRoutes = async function(servicesURL) {
     // CORS
     this.app.use(function(req, res, next) {
         res.header('Access-Control-Allow-Origin', req.get('origin'));
-        res.header('Access-Control-Allow-Methods', 'PUT, GET, POST, DELETE, PATCH');
         res.header('Access-Control-Allow-Credentials', true);
         res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, SESSIONGLUE');
         res.header('Access-Control-Allow-Methods', 'POST, GET, OPTIONS, PUT, PATCH, DELETE');
@@ -73,15 +75,22 @@ Server.prototype.configureRoutes = async function(servicesURL) {
 
     // Add routes
     this.app.use('/api', this.createRouter());
+    RestAPI(this.app);
     if (servicesURL) {
         this.app.use('/services', (req, res) => {
             const url = servicesURL + req.originalUrl.replace('/services', '');
-            return request({
+            const proxyReq = request({
                 method: req.method,
                 uri: url,
                 body: req.body,
+                headers: req.headers,
                 json: true,
-            }).pipe(res);
+            });
+            proxyReq.on('error', err => {
+                this._logger.warn(`Error occurred on call to ${url}: ${err}`);
+                res.sendStatus(500);
+            });
+            return proxyReq.pipe(res);
         });
     }
 
@@ -103,64 +112,69 @@ Server.prototype.configureRoutes = async function(servicesURL) {
     });
 
     // Initial page
-    this.app.get('/', middleware.noCache, (req, res) => {
-        return middleware.setUsername(req, res).then(() => {
-            var baseUrl = `${process.env.SERVER_PROTOCOL || req.protocol}://${req.get('host')}`,
-                url = baseUrl + req.originalUrl,
-                projectName = req.query.ProjectName,
-                metaInfo = {
-                    title: 'NetsBlox',
-                    username: req.session.username,
-                    isDevMode: isDevMode,
-                    googleAnalyticsKey: process.env.GOOGLE_ANALYTICS,
-                    clientId: Utils.getNewClientId(),
-                    servicesUrl: this.getPublicServicesUrl(),
-                    baseUrl,
-                    url: url
-                };
+    this.app.get('/', middleware.noCache, async (req, res) => {
+        await middleware.setUsername(req, res);
+        const {username} = req.session;
+        const servicesHosts = username ? await CustomServicesHosts.getServicesHosts(username, username) : [];
+        const defaultServicesUrl = this.getPublicServicesUrl();
+        if (defaultServicesUrl) {
+            servicesHosts.unshift({
+                categories: [],
+                url: defaultServicesUrl
+            });
+        }
+
+        const baseUrl = `${process.env.SERVER_PROTOCOL || req.protocol}://${req.get('host')}`,
+            url = baseUrl + req.originalUrl,
+            projectName = req.query.ProjectName,
+            metaInfo = {
+                title: 'NetsBlox',
+                username: req.session.username,
+                isDevMode: isDevMode,
+                googleAnalyticsKey: process.env.GOOGLE_ANALYTICS,
+                clientId: Utils.getNewClientId(),
+                servicesHosts,
+                baseUrl,
+                url,
+            };
 
 
-            if (req.query.action === 'present') {
-                var username = req.query.Username;
+        if (req.query.action === 'present') {
+            const owner = req.query.Username;
 
-                return Storage.publicProjects.get(username, projectName)
-                    .then(project => {
-                        if (project) {
-                            metaInfo.image = {
-                                url: baseUrl + encodeURI(`/api/projects/${project.owner}/${project.projectName}/thumbnail`),
-                                width: 640,
-                                height: 480
-                            };
-                            metaInfo.title = project.projectName;
-                            metaInfo.description = project.notes;
-                            this.addScraperSettings(req.headers['user-agent'], metaInfo);
-                        }
-                        return res.send(indexTpl(metaInfo));
-                    });
-            } else if (req.query.action === 'example' && EXAMPLES[projectName]) {
+            const project = await Storage.projects.getPublicProject(owner, projectName);
+            if (project) {
                 metaInfo.image = {
-                    url: baseUrl + encodeURI(`/api/examples/${projectName}/thumbnail`),
+                    url: baseUrl + encodeURI(`/api/projects/${project.owner}/${project.name}/thumbnail`),
                     width: 640,
                     height: 480
                 };
-                metaInfo.title = projectName;
-                var example = EXAMPLES[projectName];
-
-                return example.getRoleNames()
-                    .then(names => example.getRole(names.shift()))
-                    .then(content => {
-                        const src = content.SourceCode;
-                        const startIndex = src.indexOf('<notes>');
-                        const endIndex = src.indexOf('</notes>');
-                        const notes = src.substring(startIndex + 7, endIndex);
-
-                        metaInfo.description = notes;
-                        this.addScraperSettings(req.headers['user-agent'], metaInfo);
-                        return res.send(indexTpl(metaInfo));
-                    });
+                metaInfo.title = project.name;
+                metaInfo.description = project.notes;
+                this.addScraperSettings(req.headers['user-agent'], metaInfo);
             }
             return res.send(indexTpl(metaInfo));
-        });
+        } else if (req.query.action === 'example' && EXAMPLES[projectName]) {
+            metaInfo.image = {
+                url: baseUrl + encodeURI(`/api/examples/${projectName}/thumbnail`),
+                width: 640,
+                height: 480
+            };
+            metaInfo.title = projectName;
+            var example = EXAMPLES[projectName];
+
+            const names = await example.getRoleNames();
+            const content = await example.getRole(names.shift());
+            const src = content.SourceCode;
+            const startIndex = src.indexOf('<notes>');
+            const endIndex = src.indexOf('</notes>');
+            const notes = src.substring(startIndex + 7, endIndex);
+
+            metaInfo.description = notes;
+            this.addScraperSettings(req.headers['user-agent'], metaInfo);
+            return res.send(indexTpl(metaInfo));
+        }
+        return res.send(indexTpl(metaInfo));
     });
 
     this.app.get('/Examples/EXAMPLES', (req, res) => {
@@ -255,9 +269,9 @@ Server.prototype.addScraperSettings = function(userAgent, metaInfo) {
     }
 };
 
-Server.prototype.start = async function() {
+Server.prototype.start = async function(seedDatabase=ENV === 'test') {
     await Storage.connect();
-    if (ENV === 'test') {
+    if (seedDatabase) {
         const fixtures = require('../../test/fixtures');
         if (/test/.test(Storage._db.databaseName)) {
             // eslint-disable-next-line no-console
@@ -358,7 +372,7 @@ Server.prototype.createRouter = function() {
             router.use.apply(router, args);
         }
 
-        router.route(api.URL)[method]((req, res) => {
+        router.route(api.URL)[method](async (req, res) => {
             if (api.Service) {
                 const args = (api.Parameters || '').split(',')
                     .map(name => {
@@ -370,16 +384,10 @@ Server.prototype.createRouter = function() {
                 logger.trace(`received request ${api.Service}(${args})`);
             }
             try {
-                const result = api.Handler.call(this, req, res);
-                if (result && result.then) {
-                    result.catch(err => {
-                        logger.error(`error occurred in ${api.URL}:`, err);
-                        res.status(500).send(err.message);
-                    });
-                }
+                await api.Handler.call(this, req, res);
             } catch (err) {
-                logger.error(`error occurred in ${api.URL}:`, err);
-                res.status(500).send(err.message);
+                const statusCode = err instanceof RequestError ? 400 : 500;
+                res.status(statusCode).send(`ERROR: ${err.message}`);
             }
         });
     });

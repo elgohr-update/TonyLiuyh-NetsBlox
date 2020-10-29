@@ -9,6 +9,28 @@ var server,
 const Q = require('q');
 const Users = require('../storage/users');
 const Storage = require('../storage/storage');
+const Strategies = require('../api/core/strategies');
+const mailer = require('../mailer');
+const WELCOME_HTML = (nbUser, snapUser) =>
+`<h1>Welcome to NetsBlox!</h1>
+
+There was a recent NetsBlox login using your Snap! account, ${snapUser}. A NetsBlox account, ${nbUser}, has been created for you so you can save your projects and use all the features NetsBlox has to offer including collaboration, cloud variables, and more :)
+
+Basically, logging in with your Snap! account will log you into NetsBlox as ${nbUser} so you don't need to remember yet another username and password.
+
+<h2>FAQ</h2>
+${snapUser !== nbUser ? `<h3>Why did I get a new username?</h3>\nA NetsBlox account is required for saving NetsBlox projects (as well as other things) and ${snapUser} was already taken.\n\n` : ''}<h3>What is a "linked account"?</h3>
+A linked account enables the user to login using the given account. If I have linked my Snap! account, I can use "Login with Snap!" to login to my NetsBlox account.
+
+<h3>What does it mean to "unlink Snap! account"?</h3>
+This means that I can no longer use "Login with Snap!" to login to my NetsBlox account. If I use "Login with Snap!" after unlinking the account, it will make a new NetsBlox account and link it to the Snap! account.
+
+<h3>How can I login if I unlink the account?</h3>
+You can always login using your NetsBlox password. If you have not set up a password, you can use "Reset Password" from the NetsBlox editor.
+
+<h3>What if I change my password in NetsBlox? Will my password change in Snap!?</h3>
+No. NetsBlox accounts (even those with a linked Snap! account) still can login using their own password. Resetting or changing a password in NetsBlox will change the NetsBlox password. If you would like to change the password for your Snap! account, please do so from the Snap! website.
+`.replace(/\n/g, '<br/>');
 
 var hasSocket = function(req, res, next) {
     var socketId = (req.body && req.body.socketId) ||
@@ -48,7 +70,6 @@ function tryLogIn (req, res, cb, skipRefresh) {
 
     req.session = req.session || new Session(res);
     if (cookie) {
-        // verify the cookie is valid
         logger.trace('validating cookie');
         jwt.verify(cookie, sessionSecret, (err, token) => {
             if (err) {
@@ -69,8 +90,8 @@ function tryLogIn (req, res, cb, skipRefresh) {
     }
 }
 
-function login(req, res) {
-    const hash = req.body.__h;
+async function login(req, res) {
+    const pwdOrHash = req.body.__h;
     const isUsingCookie = !req.body.__u;
     const {clientId} = req.body;
     let loggedIn = false;
@@ -78,53 +99,93 @@ function login(req, res) {
 
     if (req.loggedIn) return Promise.resolve();
 
-    return Q.nfcall(tryLogIn, req, res)
-        .then(() => {
-            loggedIn = req.loggedIn;
-            username = username || req.session.username;
+    await Q.nfcall(tryLogIn, req, res);
+    loggedIn = req.loggedIn;
+    username = username || req.session.username;
 
-            if (!username) {
-                logger.log('"passive" login failed - no session found!');
-                throw new Error('No session found');
-            }
-            logger.log(`Logging in as ${username}`);
+    if (!username) {
+        logger.log('"passive" login failed - no session found!');
+        throw new Error('No session found');
+    }
+    logger.log(`Logging in as ${username}`);
 
-            return Users.get(username);
-        })
-        .then(user => {
-
+    const {strategy} = req.query;
+    let user = null;
+    if (!loggedIn) {
+        if (!strategy) {
+            user = await Users.get(username);
             if (!user) {  // incorrect username
                 logger.log(`Could not find user "${username}"`);
                 throw new Error(`Could not find user "${username}"`);
             }
 
-            if (!loggedIn) {  // login, if needed
-                const correctPassword = user.hash === hash;
-                if (!correctPassword) {
-                    logger.log(`Incorrect password attempt for ${user.username}`);
-                    throw new Error('Incorrect password');
+            const correctPassword = user.hash === pwdOrHash;
+            if (!correctPassword) {
+                logger.log(`Failed authentication attempt for ${user.username} (${strategy})`);
+                throw new Error('Incorrect password');
+            }
+        } else {
+            const authStrategy = Strategies.find(strategy);
+            await authStrategy.authenticate(username, pwdOrHash);
+            user = await Users.findWithStrategy(username, strategy);
+
+            if (!user) {
+                const email = await authStrategy.getEmail(username, pwdOrHash);
+                user = Users.new(username, email);
+                user.linkedAccounts.push({username, type: strategy});
+                let saved = false;
+                let count = 0;
+                const strategySuffix = strategy.toLowerCase()
+                    .replace(/[^a-zA-Z]/g, '');
+                while (!saved) {
+                    const userData = user._saveable();
+                    const result = await Users.collection.updateOne(
+                        user.getStorageId(),
+                        {$setOnInsert: userData},
+                        {upsert: true},
+                    );
+                    saved = result.upsertedCount === 1;
+                    if (!saved) {
+                        count++;
+                        if (count > 1) {
+                            user.username = `${username}${count}_${strategySuffix}`;
+                        } else {
+                            user.username = `${username}_${strategySuffix}`;
+                        }
+                    }
                 }
-                logger.log(`"${user.username}" has logged in.`);
+
+                try {
+                    await mailer.sendMail({
+                        to: user.email,
+                        subject: 'Welcome to NetsBlox!',
+                        html: WELCOME_HTML(user.username, username)
+                    });
+                } catch (err) {
+                    logger.error(`Unable to send welcome email: ${err}`);
+                }
             }
+        }
+    }
 
-            req.session.user = user;
-            user.recordLogin();
+    user = user || await Users.get(username);
+    logger.log(`"${user.username}" has logged in.`);
+    req.session.user = user;
+    user.recordLogin();
 
-            if (!isUsingCookie) {  // save the cookie, if needed
-                saveLogin(res, user, req.body.remember);
-            }
+    if (!isUsingCookie) {  // save the cookie, if needed
+        saveLogin(res, user, req.body.remember);
+    }
 
-            const socket = NetworkTopology.getSocket(clientId);
-            if (socket) {
-                socket.username = username;
-            }
+    const socket = NetworkTopology.getSocket(clientId);
+    if (socket) {
+        socket.username = username;
+    }
 
-            req.loggedIn = true;
-            req.session = req.session || new Session(res);
-            req.session.username = user.username;
-            req.session.user = user;
-        });
-
+    req.loggedIn = true;
+    req.session = req.session || new Session(res);
+    req.session.username = user.username;
+    req.session.user = user;
 }
 
 var isLoggedIn = function(req, res, next) {
@@ -156,14 +217,27 @@ var saveLogin = function(res, user, remember) {
     refreshCookie(res, cookie);
 };
 
+function getCookieOptions() {
+    const options = {
+        httpOnly: true,
+    };
+
+    if (process.env.HOST !== undefined) {
+        options.domain = process.env.HOST;
+    }
+    if (process.env.SERVER_PROTOCOL === 'https') {
+        options.sameSite = 'None';
+        options.secure = true;
+    }
+
+    return options;
+}
+
 var refreshCookie = function(res, cookie) {
     var token = jwt.sign(cookie, sessionSecret),
-        options = {
-            httpOnly: true
-        },
+        options = getCookieOptions(),
         date;
 
-    if (process.env.HOST !== undefined) options.domain = process.env.HOST;
     if (cookie.remember) {
         date = new Date();
         date.setDate(date.getDate() + 14);  // valid for 2 weeks
@@ -181,10 +255,8 @@ var Session = function(res) {
 
 Session.prototype.destroy = function() {
     // TODO: Change this to a blacklist
-    const options = {
-        httpOnly: true,
-        expires: new Date(0)
-    };
+    const options = getCookieOptions();
+    options.expires = new Date(0);
 
     if (process.env.HOST !== undefined) options.domain = process.env.HOST;
 

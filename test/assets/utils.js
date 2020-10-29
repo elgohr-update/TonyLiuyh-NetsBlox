@@ -23,7 +23,7 @@ NetworkTopology.init(new Logger('netsblox:test'), Client);
 
 // load the *exact* XML_Serializer from Snap!... pretty hacky...
 (function() {
-    var clientDir = path.join(PROJECT_ROOT, 'src', 'browser'),
+    var clientDir = path.join(PROJECT_ROOT, 'src', 'browser', 'src'),
         srcFiles = ['morphic.js', 'xml.js', 'store.js', 'actions.js'],
         src;
 
@@ -72,7 +72,7 @@ const canLoadXml = string => {
     var xml;
 
     // Add a collabId and reserialize
-    var res = Browser.SnapActions.uniqueIdForImport(string);
+    var res = Browser.SnapActions.assignUniqueIds(string);
     xml = res.toString();
     assert(parser.parse(xml));
 };
@@ -152,7 +152,7 @@ const clearCache = function() {
     });
 };
 
-const reset = function() {
+const reset = function(seedDefaults=true) {
     let db = null;
     // TODO: load the seed data
     // Reload the server and the paths
@@ -164,7 +164,8 @@ const reset = function() {
     return Q(connect())
         .then(_db => db = _db)
         .then(() => db.dropDatabase())
-        .then(() => fixtures.init(Storage))
+        .then(() => fixtures.init(Storage, db))
+        .then(() => seedDefaults && fixtures.seedDefaults(Storage))
         .then(() => logger.info('Finished loading test fixtures!'))
         .then(() => Storage._db);
 };
@@ -174,6 +175,38 @@ const sleep = delay => {
     setTimeout(deferred.resolve, delay);
     return deferred.promise;
 };
+
+async function shouldThrow(fn, Err, msg) {
+    try {
+        await fn();
+    } catch (err) {
+        if (err instanceof Error) {
+            assert.equal(err.constructor.name, Err.name, `Expected ${Err.name}. Found ${err}`);
+        } else {
+            console.error(`Caught ${typeof err}:`, err);
+        }
+        return;
+    }
+    throw new Error(msg || `Expected fn to throw ${Err.name}`);
+}
+
+function suiteName(filename) {
+    return filename
+        .replace(PROJECT_ROOT, '')
+        .replace(new RegExp('/test/(unit/server|[a-z]+)/'), '')
+        .replace(/\.js$/, '');
+}
+
+async function expect(fn, err) {
+    const start = Date.now();
+    const maxEndTime = start + 1500;
+    while (!await fn()) {
+        await sleep(25);
+        if (Date.now() > maxEndTime) {
+            throw err;
+        }
+    }
+}
 
 module.exports = {
     verifyRPCInterfaces: function(serviceName, interfaces) {
@@ -191,6 +224,16 @@ module.exports = {
                     assert(_.isEqual(args, expected), `Found ${args.join(', ')}`);
                 });
             });
+
+            it(`should not have any untested RPCs`, function() {
+                const expectedRPCs = interfaces.map(pair => pair[0]);
+                const actualRPCs = Services.getMethodsFor(serviceName);
+                const untestedRPCs = _.difference(actualRPCs, expectedRPCs);
+                assert(
+                    untestedRPCs.length === 0,
+                    `Found extra (untested) RPCs: ${untestedRPCs.join(', ')}`
+                );
+            });
         });
     },
     XML_Serializer: Client.XML_Serializer,
@@ -203,6 +246,11 @@ module.exports = {
     createRoom: createRoom,
     createSocket: createSocket,
     sendEmptyRole: sendEmptyRole,
+    shouldThrow,
+    fixtures,
+    suiteName,
+    expect,
+    nop: () => {},
 
     reqSrc
 };
